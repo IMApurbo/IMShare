@@ -390,6 +390,7 @@ class IMSharePeer {
     this.pendingReceive = null        // {peerId, meta, resolve, reject} or null
     this._recvBuffers   = new Map()   // peerId → {chunks, meta, accepted, done}
     this._sendAbort     = false
+    this._activeReceivePeer = null    // peerId of current inbound transfer
     this._connect()
   }
 
@@ -491,6 +492,7 @@ class IMSharePeer {
       // ── FILE_OFFER ─────────────────────────────────────
       if (msg.type === 'FILE_OFFER') {
         this._recvBuffers.set(peerId, {chunks:[],meta:msg,accepted:false,done:false})
+        this._activeReceivePeer = peerId   // track who we're receiving from
         this.pendingReceive = {
           peerId, meta: msg,
           resolve: () => {
@@ -501,7 +503,7 @@ class IMSharePeer {
             const dc = this.dataChannels.get(peerId)
             if (dc && dc.readyState==='open') dc.send(JSON.stringify({type:'FILE_ACCEPTED'}))
           },
-          reject: () => { this._recvBuffers.delete(peerId); this.pendingReceive = null }
+          reject: () => { this._recvBuffers.delete(peerId); this._activeReceivePeer = null; this.pendingReceive = null }
         }
         this.onFileOffer(peerId, msg)
         return
@@ -525,7 +527,12 @@ class IMSharePeer {
       // ── FILE_ABORT (either side) ───────────────────────
       if (msg.type === 'FILE_ABORT') {
         this._recvBuffers.delete(peerId)
+        this._activeReceivePeer = null
         if (this.pendingReceive && this.pendingReceive.peerId===peerId) this.pendingReceive=null
+        // Stop the streaming loop on the sender side if it's running
+        this._sendAbort = true
+        this._pendingSendFile = null
+        this._pendingSendPeer = null
         this.onTransferAborted && this.onTransferAborted(peerId)
         return
       }
@@ -605,12 +612,20 @@ class IMSharePeer {
   }
 
   cancelReceive() {
-    if (this.pendingReceive) {
-      const dc = this.dataChannels.get(this.pendingReceive.peerId)
-      if (dc && dc.readyState==='open') dc.send(JSON.stringify({type:'FILE_ABORT'}))
-      this._recvBuffers.delete(this.pendingReceive.peerId)
-      this.pendingReceive = null
+    // Determine who we're receiving from — either still pending or already accepted
+    const peerId = this.pendingReceive
+      ? this.pendingReceive.peerId
+      : this._activeReceivePeer
+
+    if (peerId) {
+      const dc = this.dataChannels.get(peerId)
+      if (dc && dc.readyState === 'open') dc.send(JSON.stringify({type:'FILE_ABORT'}))
+      this._recvBuffers.delete(peerId)
+      this._activeReceivePeer = null
     }
+
+    if (this.pendingReceive) this.pendingReceive = null
+
     this.onReceiveCancelled && this.onReceiveCancelled()
   }
 
@@ -624,6 +639,7 @@ class IMSharePeer {
 
   _triggerDownload(peerId) {
     const state = this._recvBuffers.get(peerId); if(!state) return
+    this._activeReceivePeer = null
     const blob = new Blob(state.chunks, {type: state.meta.mime||'application/octet-stream'})
     const url  = URL.createObjectURL(blob)
     const a = document.createElement('a'); a.href=url; a.download=state.meta.name; a.click()
